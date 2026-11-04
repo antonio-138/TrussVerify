@@ -604,7 +604,72 @@ with tab1:
             x * (F[2 * idx + 1] + reactions[2 * idx + 1])
             - y * (F[2 * idx] + reactions[2 * idx])
         )
+    # STEP-BY-STEP GLOBAL EQUILIBRIUM
+    st.subheader("Step-by-Step Equilibrium Verification")
+    st.caption(
+        "Positive X is right, positive Y is up, "
+        "and positive moment is counterclockwise."
+    )
 
+    force_x_terms = []
+    force_y_terms = []
+    moment_terms = []
+
+    for joint, idx in node_index.items():
+        x, y = nodes[joint]
+
+        fx = float(F[2 * idx])
+        fy = float(F[2 * idx + 1])
+
+        rx = float(reactions[2 * idx])
+        ry = float(reactions[2 * idx + 1])
+
+        if abs(fx) > 1e-10:
+            force_x_terms.append(f"({fx:+.3f})")
+
+        if abs(fy) > 1e-10:
+            force_y_terms.append(f"({fy:+.3f})")
+
+        if abs(rx) > 1e-10:
+            force_x_terms.append(f"({rx:+.3f})")
+
+        if abs(ry) > 1e-10:
+            force_y_terms.append(f"({ry:+.3f})")
+
+        # Moments about the global origin (0, 0)
+        if abs(fx) > 1e-10 or abs(fy) > 1e-10:
+            moment_terms.append(
+                f"[({x:.2f})({fy:+.3f}) "
+                f"- ({y:.2f})({fx:+.3f})]"
+            )
+
+        if abs(rx) > 1e-10 or abs(ry) > 1e-10:
+            moment_terms.append(
+                f"[({x:.2f})({ry:+.3f}) "
+                f"- ({y:.2f})({rx:+.3f})]"
+            )
+
+    st.markdown("**1. Horizontal Force Equilibrium**")
+    st.latex(r"\sum F_x = 0")
+    st.code(
+        " + ".join(force_x_terms or ["0"])
+        + f" = {total_fx:.6f} kip"
+    )
+
+    st.markdown("**2. Vertical Force Equilibrium**")
+    st.latex(r"\sum F_y = 0")
+    st.code(
+        " + ".join(force_y_terms or ["0"])
+        + f" = {total_fy:.6f} kip"
+    )
+
+    st.markdown("**3. Moment Equilibrium About the Origin**")
+    st.latex(r"\sum M_O = \sum(xF_y-yF_x)=0")
+    st.code(
+        " + ".join(moment_terms or ["0"])
+        + f" = {total_moment:.6f} kip-in"
+    )
+    
     st.write("Equilibrium checks:")
     st.write(f"ΣFx = {total_fx:.6f} kip")
     st.write(f"ΣFy = {total_fy:.6f} kip")
