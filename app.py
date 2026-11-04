@@ -442,10 +442,88 @@ for _, row in loads_df.iterrows():
         fontsize=9
     )
 
+# DRAW SUPPORT SYMBOLS
+# Symbols update automatically from the Support Editor.
 
-ax.set_aspect("equal", adjustable="datalim")
+symbol_size = 0.035 * max(model_width, model_height)
+
+for _, row in supports_df.iterrows():
+    joint = str(row["Joint"])
+    support_type = str(row["Support Type"])
+
+    if support_type == "Remove Support":
+        continue
+
+    x, y = nodes[joint]
+
+    if support_type in ["Pin", "Fixed"]:
+        # Triangle below the supported joint
+        ax.scatter(
+            x, y,
+            marker="^",
+            s=230,
+            facecolor="lightgray",
+            edgecolor="black",
+            linewidth=1.5,
+            zorder=4
+        )
+
+    elif support_type == "Horizontal Roller":
+        # Roller beneath the joint
+        ax.scatter(
+            x, y - symbol_size,
+            marker="o",
+            s=100,
+            facecolor="white",
+            edgecolor="black",
+            linewidth=1.5,
+            zorder=4
+        )
+
+        ax.plot(
+            [x - symbol_size, x + symbol_size],
+            [y - 2 * symbol_size, y - 2 * symbol_size],
+            color="black",
+            linewidth=2
+        )
+
+    elif support_type == "Vertical Roller":
+        # Roller beside a vertical wall
+        ax.scatter(
+            x - symbol_size, y,
+            marker="o",
+            s=100,
+            facecolor="white",
+            edgecolor="black",
+            linewidth=1.5,
+            zorder=4
+        )
+
+        ax.plot(
+            [x - 2 * symbol_size, x - 2 * symbol_size],
+            [y - symbol_size, y + symbol_size],
+            color="black",
+            linewidth=2
+        )
+
+
+
+# Leave room around the truss for supports and load arrows
+x_values = [p[0] for p in nodes.values()]
+y_values = [p[1] for p in nodes.values()]
+
+padding = 0.25 * max(model_width, model_height)
+
+ax.set_xlim(min(x_values) - padding, max(x_values) + padding)
+ax.set_ylim(
+    min(y_values) - padding,
+    max(y_values) + padding + arrow_length
+)
+
+ax.set_aspect("equal", adjustable="box")
 ax.set_xlabel("X (in)")
 ax.set_ylabel("Y (in)")
+
 ax.grid(alpha=0.25)
 ax.set_title("Blue = Tension | Red = Compression | Green = Load")
 st.pyplot(fig)
