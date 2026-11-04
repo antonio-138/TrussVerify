@@ -227,10 +227,64 @@ st.sidebar.caption(
     "All members currently share the selected properties."
 )
 
-st.sidebar.header("Actual Joint Loads")
-load_joint = st.sidebar.selectbox("Loaded joint", node_names, index=1)
-Fx = st.sidebar.number_input("Horizontal force Fx (kip)", value=0.0)
-Fy = st.sidebar.number_input("Vertical force Fy (kip)", value=-10.0)
+
+# MULTIPLE JOINT LOAD EDITOR
+st.subheader("Joint Load Editor")
+st.caption(
+    "Apply horizontal and vertical loads at any joint. "
+    "Positive Fx = right, positive Fy = up. "
+    "Negative Fx = left, negative Fy = down. "
+    "All forces are in kips."
+)
+
+default_loads = pd.DataFrame([
+    {"Joint": "B", "Fx (kip)": 0.0, "Fy (kip)": -10.0}
+])
+
+loads_df = st.data_editor(
+    default_loads,
+    num_rows="dynamic",
+    hide_index=True,
+    width="stretch",
+    key="load_editor",
+    column_config={
+        "Joint": st.column_config.SelectboxColumn(
+            "Joint",
+            options=node_names,
+            required=True
+        ),
+        "Fx (kip)": st.column_config.NumberColumn(
+            "Fx (kip)",
+            required=True,
+            format="%.3f"
+        ),
+        "Fy (kip)": st.column_config.NumberColumn(
+            "Fy (kip)",
+            required=True,
+            format="%.3f"
+        )
+    }
+)
+
+# Validate and collect all applied loads
+try:
+    if loads_df.isnull().any().any():
+        raise ValueError("Every load needs a joint, Fx, and Fy.")
+
+    for _, row in loads_df.iterrows():
+        if str(row["Joint"]) not in node_index:
+            raise ValueError(
+                f"Load references an unknown joint: {row['Joint']}"
+            )
+
+except ValueError as error:
+    st.error(f"Invalid load configuration: {error}")
+    st.stop()
+
+# Totals for force equilibrium checks
+Fx = float(loads_df["Fx (kip)"].sum())
+Fy = float(loads_df["Fy (kip)"].sum())
+
 
 st.sidebar.header("Virtual Work")
 virtual_joint = st.sidebar.selectbox(
@@ -283,10 +337,17 @@ def solve(force_vector):
 
     return displacement, reactions, np.array(axial_forces)
 
+
+# Build the global force vector from ALL joint loads
 F = np.zeros(ndof)
-loaded_idx = node_index[load_joint]
-F[2*loaded_idx] = Fx
-F[2*loaded_idx+1] = Fy
+
+for _, row in loads_df.iterrows():
+    joint = str(row["Joint"])
+    idx = node_index[joint]
+
+    F[2 * idx] += float(row["Fx (kip)"])
+    F[2 * idx + 1] += float(row["Fy (kip)"])
+
 
 unit = np.zeros(ndof)
 virtual_idx = node_index[virtual_joint]
@@ -323,18 +384,41 @@ for name, (x, y) in nodes.items():
 
 
 # Draw the actual applied load arrow
-x, y = nodes[load_joint]
 
-if abs(Fx) > 1e-10 or abs(Fy) > 1e-10:
-    magnitude = np.hypot(Fx, Fy)
+# DRAW ALL APPLIED JOINT LOADS
+# Geometry is in inches; forces are in kips.
 
-    # Arrow direction follows the applied force
-    ux = Fx / magnitude
-    uy = Fy / magnitude
+model_width = max(
+    max(x for x, y in nodes.values())
+    - min(x for x, y in nodes.values()),
+    1.0
+)
 
-    arrow_length = 2.0
+model_height = max(
+    max(y for x, y in nodes.values())
+    - min(y for x, y in nodes.values()),
+    1.0
+)
 
-    # Start behind the joint and point toward the joint
+arrow_length = 0.15 * max(model_width, model_height)
+
+for _, row in loads_df.iterrows():
+    joint = str(row["Joint"])
+    fx = float(row["Fx (kip)"])
+    fy = float(row["Fy (kip)"])
+
+    magnitude = np.hypot(fx, fy)
+
+    if magnitude < 1e-10:
+        continue
+
+    x, y = nodes[joint]
+
+    # Unit vector in the applied load direction
+    ux = fx / magnitude
+    uy = fy / magnitude
+
+    # Arrow points toward the loaded joint
     start_x = x - arrow_length * ux
     start_y = y - arrow_length * uy
 
@@ -349,6 +433,7 @@ if abs(Fx) > 1e-10 or abs(Fy) > 1e-10:
             mutation_scale=18
         )
     )
+
     ax.text(
         start_x,
         start_y,
@@ -356,6 +441,7 @@ if abs(Fx) > 1e-10 or abs(Fy) > 1e-10:
         color="green",
         fontsize=9
     )
+
 
 ax.set_aspect("equal", adjustable="datalim")
 ax.set_xlabel("X (in)")
@@ -385,9 +471,36 @@ with tab1:
         hide_index=True,
         use_container_width=True
     )
+    
+    # Check global equilibrium
+    total_fx = float(F[0::2].sum() + reactions[0::2].sum())
+    total_fy = float(F[1::2].sum() + reactions[1::2].sum())
+
+    total_moment = 0.0
+
+    for joint, idx in node_index.items():
+        x, y = nodes[joint]
+
+        # Moment = x*Fy - y*Fx (counterclockwise positive)
+        total_moment += (
+            x * (F[2 * idx + 1] + reactions[2 * idx + 1])
+            - y * (F[2 * idx] + reactions[2 * idx])
+        )
+
     st.write("Equilibrium checks:")
-    st.write(f"ΣFx = {Fx + sum(reactions[0::2]):.6f} kip")
-    st.write(f"ΣFy = {Fy + sum(reactions[1::2]):.6f} kip")
+    st.write(f"ΣFx = {total_fx:.6f} kip")
+    st.write(f"ΣFy = {total_fy:.6f} kip")
+    st.write(f"ΣM = {total_moment:.6f} kip-in")
+
+    if (
+        abs(total_fx) < 1e-6
+        and abs(total_fy) < 1e-6
+        and abs(total_moment) < 1e-4
+    ):
+        st.success("PASS: Global equilibrium is satisfied.")
+    else:
+        st.error("CHECK: Global equilibrium is not satisfied.")
+
 
 with tab2:
     st.subheader("Axial Member Forces")
