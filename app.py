@@ -185,6 +185,31 @@ default_members = pd.DataFrame([
     }
 ])
 
+# USE IMPORTED STAAD.PRO GEOMETRY WHEN AVAILABLE
+if uploaded_std is not None and imported_nodes and imported_members:
+    default_joints = pd.DataFrame([
+        {
+            "Joint": joint_id,
+            "X (in)": x,
+            "Y (in)": y
+        }
+        for joint_id, (x, y) in imported_nodes.items()
+    ])
+
+    default_members = pd.DataFrame([
+        {
+            "Start": start,
+            "End": end,
+            "Material": "Steel",
+            "Area (in²)": 2.0
+        }
+        for member_id, start, end in imported_members
+    ])
+
+    st.success(
+        "STAAD.Pro geometry loaded into the Joints and Members editors."
+    )
+
 
 st.markdown("#### Joints")
 joints_df = st.data_editor(
@@ -844,6 +869,206 @@ with tab2:
     st.dataframe(pd.DataFrame(rows), hide_index=True,
                  use_container_width=True)
     st.caption("Positive axial force = tension; negative = compression.")
+
+    
+    # STEP-BY-STEP METHOD OF JOINTS
+    st.divider()
+    st.subheader("Step-by-Step Method of Joints")
+    st.caption(
+        "Joint equilibrium using member lengths. "
+        "Positive axial force means tension; negative means compression."
+    )
+
+    # Build geometry and joint connections independently of stiffness.
+    member_info = []
+    connected = {joint: [] for joint in nodes}
+
+    for j, (start, end) in enumerate(members):
+        x1, y1 = nodes[start]
+        x2, y2 = nodes[end]
+        dx = x2 - x1
+        dy = y2 - y1
+        L = float(np.hypot(dx, dy))
+
+        if L <= 1e-12:
+            st.error(f"Member {start}-{end} has zero length.")
+            st.stop()
+
+        member_info.append((start, end, dx, dy, L))
+        connected[start].append((j, dx / L, dy / L))
+        connected[end].append((j, -dx / L, -dy / L))
+
+    # Applied joint loads plus stiffness-method reactions.
+    # Reactions will be independently calculated in a later step.
+    joint_external = {}
+    for joint, idx in node_index.items():
+        joint_external[joint] = (
+            float(F[2 * idx] + reactions[2 * idx]),
+            float(F[2 * idx + 1] + reactions[2 * idx + 1])
+        )
+
+    solved_forces = {}
+    steps = []
+    tolerance = 1e-8
+
+    # Repeatedly find joints with one or two unknown members.
+    while len(solved_forces) < len(members):
+        progress = False
+
+        for joint in nodes:
+            unknown = [
+                (j, cx, cy)
+                for j, cx, cy in connected[joint]
+                if j not in solved_forces
+            ]
+
+            if not unknown or len(unknown) > 2:
+                continue
+
+            known_x = joint_external[joint][0]
+            known_y = joint_external[joint][1]
+
+            for j, cx, cy in connected[joint]:
+                if j in solved_forces:
+                    known_x += solved_forces[j] * cx
+                    known_y += solved_forces[j] * cy
+
+            A_joint = np.array(
+                [[cx for _, cx, cy in unknown],
+                 [cy for _, cx, cy in unknown]],
+                dtype=float
+            )
+            b_joint = -np.array([known_x, known_y])
+
+            if np.linalg.matrix_rank(A_joint) < len(unknown):
+                continue
+
+            values = np.linalg.lstsq(
+                A_joint, b_joint, rcond=None
+            )[0]
+
+            if np.linalg.norm(
+                A_joint @ values - b_joint
+            ) > 1e-6:
+                continue
+
+            step = {
+                "joint": joint,
+                "unknown": unknown,
+                "known_x": known_x,
+                "known_y": known_y,
+                "values": values
+            }
+            steps.append(step)
+
+            for (j, cx, cy), value in zip(unknown, values):
+                solved_forces[j] = float(value)
+
+            progress = True
+            break
+
+        if not progress:
+            break
+
+    if not steps:
+        st.warning(
+            "No joint with a uniquely solvable set of one or two "
+            "unknown member forces was found."
+        )
+
+    for number, step in enumerate(steps, start=1):
+        joint = step["joint"]
+        unknown = step["unknown"]
+        known_x = step["known_x"]
+        known_y = step["known_y"]
+        values = step["values"]
+
+        st.markdown(f"### Step {number}: Joint {joint}")
+
+        # Show geometry only when a diagonal member is involved.
+        for j, cx, cy in unknown:
+            start, end, dx, dy, L = member_info[j]
+
+            if abs(dx) > tolerance and abs(dy) > tolerance:
+                st.write(
+                    f"Member {start}-{end}: "
+                    f"L = √({abs(dx):.3f}² + {abs(dy):.3f}²) "
+                    f"= {L:.3f} in"
+                )
+
+        # Display the joint equilibrium equations.
+        x_terms = [f"({known_x:+.4f})"]
+        y_terms = [f"({known_y:+.4f})"]
+
+        for j, cx, cy in unknown:
+            start, end, dx, dy, L = member_info[j]
+            name = f"F({start}-{end})"
+
+            if abs(cx) > tolerance:
+                x_terms.append(
+                    f"({cx:+.4f}){name}"
+                )
+            if abs(cy) > tolerance:
+                y_terms.append(
+                    f"({cy:+.4f}){name}"
+                )
+
+        st.markdown("**Horizontal equilibrium**")
+        st.latex(r"\sum F_x=0")
+        st.code(" + ".join(x_terms) + " = 0")
+
+        st.markdown("**Vertical equilibrium**")
+        st.latex(r"\sum F_y=0")
+        st.code(" + ".join(y_terms) + " = 0")
+
+        # Show substituted numerical equations and solutions.
+        st.markdown("**Solve the unknown member forces**")
+
+        for (j, cx, cy), value in zip(unknown, values):
+            start, end, dx, dy, L = member_info[j]
+            classification = (
+                "Tension" if value > tolerance
+                else "Compression" if value < -tolerance
+                else "Zero-force"
+            )
+
+            st.write(
+                f"F({start}-{end}) = {value:+.6f} kip "
+                f"({classification})"
+            )
+
+    if len(solved_forces) != len(members):
+        st.warning(
+            f"Method of Joints solved {len(solved_forces)} "
+            f"of {len(members)} member forces. "
+            "The remaining forces require a different equilibrium "
+            "strategy or cannot be uniquely determined by this method."
+        )
+    else:
+        st.success("All member forces solved by Method of Joints.")
+
+        comparison_rows = []
+        for j, (start, end) in enumerate(members):
+            joint_value = solved_forces[j]
+            stiffness_value = float(N[j])
+
+            comparison_rows.append({
+                "Member": f"{start}-{end}",
+                "Stiffness (kip)": stiffness_value,
+                "Method of Joints (kip)": joint_value,
+                "Difference (kip)": abs(
+                    stiffness_value - joint_value
+                )
+            })
+
+        st.markdown("**Member Force Comparison**")
+        st.dataframe(
+            pd.DataFrame(comparison_rows),
+            hide_index=True,
+            use_container_width=True
+        )
+
+
 with tab3:
     st.subheader("Joint Displacements")
     rows = []
@@ -855,6 +1080,147 @@ with tab3:
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True,
                  use_container_width=True)
+
+    # STEP-BY-STEP DISPLACEMENT CALCULATIONS
+    st.divider()
+    st.subheader("Step-by-Step Joint Displacement Calculations")
+
+    st.markdown("### Step 1: Member Stiffness Calculations")
+
+    for j, (start, end, L, c, s, dofs, member_E, member_A) in enumerate(member_data):
+        x1, y1 = nodes[start]
+        x2, y2 = nodes[end]
+
+        dx = x2 - x1
+        dy = y2 - y1
+
+        st.markdown(f"**Member {start}–{end}**")
+
+        if abs(dx) > 1e-10 and abs(dy) > 1e-10:
+            st.write(
+                f"L = √({abs(dx):.3f}² + {abs(dy):.3f}²) "
+                f"= {L:.3f} in"
+            )
+        else:
+            st.write(f"L = {L:.3f} in")
+
+        AE = member_A * member_E
+        k = AE / L
+
+        st.write(
+            f"AE = ({member_A:.3f} in²)"
+            f"({member_E:.3f} kip/in²)"
+            f" = {AE:.3f} kip"
+        )
+
+        st.write(
+            f"k = AE/L = {AE:.3f}/{L:.3f} "
+            f"= {k:.6f} kip/in"
+        )
+
+        st.write(
+            f"c = Δx/L = {dx:.3f}/{L:.3f} = {c:.6f}"
+        )
+        st.write(
+            f"s = Δy/L = {dy:.3f}/{L:.3f} = {s:.6f}"
+        )
+
+    st.markdown("### Step 2: Global Stiffness Matrix")
+
+    st.latex(r"K=\sum k_e")
+
+    st.caption(
+        "The global stiffness matrix is assembled by adding "
+        "each member's stiffness contribution at its joint degrees "
+        "of freedom. Matrix units: kip/in."
+    )
+
+    st.dataframe(
+        pd.DataFrame(
+            K,
+            index=[
+                f"{joint}-{direction}"
+                for joint in node_index
+                for direction in ("X", "Y")
+            ],
+            columns=[
+                f"{joint}-{direction}"
+                for joint in node_index
+                for direction in ("X", "Y")
+            ]
+        ).round(4),
+        use_container_width=True
+    )
+
+    st.markdown("### Step 3: Apply Supports and Loads")
+
+    all_dofs = np.arange(len(displacement))
+    free_dofs = np.array([
+        dof for dof in all_dofs
+        if dof not in restrained
+    ], dtype=int)
+
+    K_ff_steps = K[np.ix_(free_dofs, free_dofs)]
+    F_f_steps = F[free_dofs]
+
+    dof_labels = [
+        f"{list(node_index.keys())[dof // 2]}-"
+        f"{'X' if dof % 2 == 0 else 'Y'}"
+        for dof in free_dofs
+    ]
+
+    st.write("Unknown displacement degrees of freedom:")
+    st.write(", ".join(dof_labels))
+
+    st.latex(r"K_{ff}u_f=F_f")
+
+    st.markdown("**Reduced stiffness matrix (kip/in)**")
+    st.dataframe(
+        pd.DataFrame(
+            K_ff_steps,
+            index=dof_labels,
+            columns=dof_labels
+        ).round(5),
+        use_container_width=True
+    )
+
+    st.markdown("**Applied load vector (kip)**")
+    st.dataframe(
+        pd.DataFrame({
+            "Degree of Freedom": dof_labels,
+            "Applied Load (kip)": F_f_steps
+        }),
+        hide_index=True,
+        use_container_width=True
+    )
+
+    st.markdown("### Step 4: Solve the Displacements")
+
+    st.latex(r"u_f=K_{ff}^{-1}F_f")
+
+    st.caption(
+        "The numerical solver computes the displacement vector "
+        "by solving the reduced linear system."
+    )
+
+    displacement_steps = np.linalg.solve(
+        K_ff_steps, F_f_steps
+    )
+
+    for label, value in zip(dof_labels, displacement_steps):
+        st.write(
+            f"{label}: u = {value:+.8f} in"
+        )
+
+    difference = np.max(
+        np.abs(displacement[free_dofs] - displacement_steps)
+    )
+
+    st.write(
+        f"Maximum difference from original solver: "
+        f"{difference:.10f} in"
+    )
+
 with tab4:
     st.subheader("Method of Virtual Work")
     st.latex(r"\delta = \sum_i \frac{N_i n_i L_i}{A_i E_i}")
@@ -952,6 +1318,107 @@ with tab4:
         st.error(
             "CHECK: The two displacement results do not agree."
         )
+     
+    # STEP-BY-STEP VIRTUAL WORK CALCULATIONS
+    st.divider()
+    st.subheader("Step-by-Step Virtual Work Calculations")
+
+    st.caption(
+        "N = member force from actual loading (kip). "
+        "n = member force from a unit load at the selected joint "
+        "and direction (kip per unit load). "
+        "L = member length (in), A = area (in²), E = modulus (ksi)."
+    )
+
+    st.latex(r"\delta=\sum_i\frac{N_i n_i L_i}{A_i E_i}")
+
+    vw_contributions = []
+
+    for i, (start, end, L, c, s, dofs, member_E, member_A) in enumerate(member_data):
+        actual_force = float(N[i])
+        unit_force = float(n[i])
+
+        AE = member_A * member_E
+        numerator = actual_force * unit_force * L
+        contribution = numerator / AE
+
+        vw_contributions.append(contribution)
+
+        with st.expander(
+            f"Member {start}–{end}: "
+            f"{contribution:+.8f} in",
+            expanded=True
+        ):
+            st.markdown("**Step 1 — Calculate AE**")
+
+            st.latex(r"AE=A\times E")
+
+            st.write(
+                f"AE = ({member_A:.4f}) × ({member_E:.4f}) "
+                f"= {AE:.4f} kip"
+            )
+
+            st.markdown("**Step 2 — Multiply N × n × L**")
+
+            st.latex(r"NnL=N\times n\times L")
+
+            st.write(
+                f"NnL = ({actual_force:+.6f}) × "
+                f"({unit_force:+.6f}) × ({L:.4f}) "
+                f"= {numerator:+.8f}"
+            )
+
+            st.markdown("**Step 3 — Divide by AE**")
+
+            st.latex(r"\delta_i=\frac{N_i n_i L_i}{A_i E_i}")
+
+            st.write(
+                f"δ = ({numerator:+.8f}) / ({AE:.4f}) "
+                f"= {contribution:+.8f} in"
+            )
+
+    st.markdown("### Step 4 — Add All Member Contributions")
+
+    total_steps = float(sum(vw_contributions))
+
+    contribution_terms = [
+        f"({value:+.8f})"
+        for value in vw_contributions
+    ]
+
+    st.write("δ = " + " + ".join(contribution_terms))
+
+    st.latex(r"\delta=\sum_i\delta_i")
+
+    st.write(
+        f"**Total Virtual Work Displacement = "
+        f"{total_steps:+.8f} in**"
+    )
+
+    st.markdown("### Step 5 — Compare With Stiffness Method")
+
+    st.write(
+        f"Virtual Work: {total_steps:+.8f} in"
+    )
+
+    st.write(
+        f"Direct Stiffness Method: {direct:+.8f} in"
+    )
+
+    st.write(
+        f"Absolute Difference: "
+        f"{abs(total_steps - direct):.10f} in"
+    )
+
+    if np.isclose(total_steps, direct, atol=1e-8, rtol=1e-6):
+        st.success(
+            "PASS: Virtual Work agrees with the stiffness method."
+        )
+    else:
+        st.error(
+            "CHECK: Virtual Work and stiffness results do not agree."
+        )
+   
 st.warning(
     "This is a sample 2D truss solver. STAAD.Pro import, "
     "editable geometry, detailed hand-calculation steps, "
