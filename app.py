@@ -207,58 +207,23 @@ except ValueError as error:
     st.stop()
 
 
+# MATERIAL AND SECTION INFORMATION
+# Material and cross-sectional area are assigned
+# individually to each member in the Members Editor.
+
 st.sidebar.header("Material and Section")
-material = st.sidebar.selectbox(
-    "Choose Material",
-    ["Steel", "Aluminum", "Timber", "Custom"]
-)
-# Representative elastic modulus values in psi
-material_properties = {
-    "Steel": 29_000_000.0,
-    "Aluminum": 10_000_000.0,
-    "Timber": 1_200_000.0,
-    "Custom": 1_000_000.0
-}
-default_E_psi = material_properties[material]
-# Allow E to be entered in psi or ksi
-E_unit = st.sidebar.selectbox(
-    "Modulus Input Unit",
-    ["psi", "ksi"]
-)
-default_E = (
-    default_E_psi
-    if E_unit == "psi"
-    else default_E_psi / 1000
-)
-E_input = st.sidebar.number_input(
-    f"Modulus of Elasticity, E ({E_unit})",
-    min_value=1.0,
-    value=float(default_E),
-    key=f"E_{material}_{E_unit}"
-)
-# Convert internally to ksi
-E = E_input / 1000 if E_unit == "psi" else E_input
-A = st.sidebar.number_input(
-    "Cross-Sectional Area, A (in²)",
-    min_value=0.01,
-    value=5.25 if material == "Timber" else 2.0,
-    key=f"A_{material}"
-)
-EA = E * A
-st.sidebar.metric(
-    "Modulus E (ksi)",
-    f"{E:,.2f}"
-)
-st.sidebar.metric(
-    "Axial Stiffness EA (kip)",
-    f"{EA:,.2f}"
-)
-st.sidebar.caption(
-    "All calculations use kips and inches. "
-    "Material values are illustrative and editable. "
-    "All members currently share the selected properties."
+
+st.sidebar.info(
+    "Material and cross-sectional area are assigned "
+    "individually to each truss member using the "
+    "Members Editor."
 )
 
+st.sidebar.caption(
+    "Calculations use kips and inches. "
+    "Each member uses its own material properties "
+    "and cross-sectional area."
+)
 
 # MULTIPLE JOINT LOAD EDITOR
 st.subheader("Joint Load Editor")
