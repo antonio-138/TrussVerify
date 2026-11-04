@@ -17,12 +17,140 @@ uploaded_std = st.file_uploader(
     help="Upload a compatible 2D truss model."
 )
 
+
 if uploaded_std is not None:
     st.success(f"File selected: {uploaded_std.name}")
-    st.info(
-        "File upload is working. "
-        "Geometry and property extraction will be added next."
+
+    std_text = uploaded_std.getvalue().decode(
+        "utf-8", errors="replace"
     )
+
+    
+    # Extract STAAD.Pro joint coordinates and member connections
+    import re
+
+    lines = std_text.upper().splitlines()
+
+    def get_staad_section(start_name):
+        collecting = False
+        section_lines = []
+
+        section_endings = (
+            "MEMBER INCIDENCES",
+            "JOINT COORDINATES",
+            "DEFINE ",
+            "CONSTANTS",
+            "SUPPORTS",
+            "UNIT ",
+            "FINISH",
+            "START ",
+            "MEMBER PROPERTY",
+            "ELEMENT INCIDENCES",
+            "LOAD ",
+        )
+
+        for line in lines:
+            line = line.strip()
+
+            if line.startswith(start_name):
+                collecting = True
+                continue
+
+            if collecting:
+                if any(line.startswith(x) for x in section_endings):
+                    break
+                section_lines.append(line)
+
+        return " ".join(section_lines)
+
+    joint_text = get_staad_section("JOINT COORDINATES")
+    member_text = get_staad_section("MEMBER INCIDENCES")
+
+    imported_nodes = {}
+    imported_members = []
+
+    try:
+        for entry in joint_text.split(";"):
+            values = entry.strip().split()
+            if not values:
+                continue
+            if len(values) != 4:
+                raise ValueError("Unsupported joint coordinate entry.")
+            joint_id = str(int(values[0]))
+            x, y, z = map(float, values[1:])
+            if abs(z) > 1e-8:
+                raise ValueError(
+                    "This model has nonzero Z coordinates; "
+                    "the 2D importer cannot display it."
+                )
+            if joint_id in imported_nodes:
+                raise ValueError("Duplicate joint ID.")
+            imported_nodes[joint_id] = (x, y)
+
+        for entry in member_text.split(";"):
+            values = entry.strip().split()
+            if not values:
+                continue
+            if len(values) != 3:
+                raise ValueError("Unsupported member incidence entry.")
+            member_id, start, end = values
+            if start not in imported_nodes or end not in imported_nodes:
+                raise ValueError("Member references an unknown joint.")
+            imported_members.append((member_id, start, end))
+
+        if not imported_nodes or not imported_members:
+            raise ValueError("No supported joints or members were found.")
+
+        st.subheader("Imported STAAD.Pro Truss")
+
+        fig_import, ax_import = plt.subplots(figsize=(9, 5))
+
+        for member_id, start, end in imported_members:
+            x1, y1 = imported_nodes[start]
+            x2, y2 = imported_nodes[end]
+            ax_import.plot(
+                [x1, x2], [y1, y2],
+                color="steelblue", linewidth=3
+            )
+            ax_import.text(
+                (x1 + x2) / 2,
+                (y1 + y2) / 2,
+                member_id,
+                color="darkred",
+                fontsize=10
+            )
+
+        for joint_id, (x, y) in imported_nodes.items():
+            ax_import.plot(x, y, "ko", markersize=7)
+            ax_import.annotate(
+                joint_id, (x, y),
+                xytext=(7, 7),
+                textcoords="offset points"
+            )
+
+        ax_import.set_xlabel("X (in)")
+        ax_import.set_ylabel("Y (in)")
+        ax_import.set_title("STAAD.Pro Imported Geometry")
+        ax_import.set_aspect("equal", adjustable="datalim")
+        ax_import.grid(True, alpha=0.3)
+
+        st.pyplot(fig_import)
+        plt.close(fig_import)
+
+        st.success(
+            f"Imported {len(imported_nodes)} joints and "
+            f"{len(imported_members)} members."
+        )
+
+    except (ValueError, TypeError) as exc:
+        st.error(f"Could not import STAAD.Pro geometry: {exc}")
+
+
+    st.info(
+        "File contents loaded successfully. "
+        "Next, we will extract the joints and members."
+    )
+
 
 
 # CUSTOM TRUSS GEOMETRY EDITOR
