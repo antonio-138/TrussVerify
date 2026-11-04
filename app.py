@@ -8,15 +8,172 @@ st.set_page_config(page_title="TrussVerify", page_icon="🏗️", layout="wide")
 st.title("🏗️ TrussVerify")
 st.caption("Independent 2D Truss Analysis and Verification")
 
-# SAMPLE MODEL — replace with imported STAAD.Pro geometry later
-nodes = {
-    "A": (0.0, 0.0),
-    "B": (10.0, 8.0),
-    "C": (20.0, 0.0),
-}
-members = [("A", "B"), ("B", "C"), ("A", "C")]
+
+# CUSTOM TRUSS GEOMETRY EDITOR
+st.subheader("Custom Truss Geometry")
+st.caption("Enter joint coordinates in inches.")
+
+default_joints = pd.DataFrame([
+    {"Joint": "A", "X (in)": 0.0, "Y (in)": 0.0},
+    {"Joint": "B", "X (in)": 120.0, "Y (in)": 96.0},
+    {"Joint": "C", "X (in)": 240.0, "Y (in)": 0.0},
+])
+
+default_members = pd.DataFrame([
+    {"Start": "A", "End": "B"},
+    {"Start": "B", "End": "C"},
+    {"Start": "A", "End": "C"},
+])
+
+st.markdown("#### Joints")
+joints_df = st.data_editor(
+    default_joints,
+    num_rows="dynamic",
+    hide_index=True,
+    use_container_width=True,
+    key="joint_editor"
+)
+
+st.markdown("#### Members")
+members_df = st.data_editor(
+    default_members,
+    num_rows="dynamic",
+    hide_index=True,
+    use_container_width=True,
+    key="member_editor"
+)
+
+# Validate the entered geometry before analysis
+try:
+    if joints_df.empty or members_df.empty:
+        raise ValueError("At least one joint and member are required.")
+
+    if joints_df[["Joint", "X (in)", "Y (in)"]].isnull().any().any():
+        raise ValueError("Every joint needs a name and X/Y coordinates.")
+
+    if members_df[["Start", "End"]].isnull().any().any():
+        raise ValueError("Every member needs a start and end joint.")
+
+    joint_ids = joints_df["Joint"].astype(str).str.strip()
+
+    if joint_ids.duplicated().any():
+        raise ValueError("Joint names must be unique.")
+
+    nodes = {
+        str(row["Joint"]).strip(): (
+            float(row["X (in)"]),
+            float(row["Y (in)"])
+        )
+        for _, row in joints_df.iterrows()
+    }
+
+    members = [
+        (str(row["Start"]).strip(), str(row["End"]).strip())
+        for _, row in members_df.iterrows()
+    ]
+
+    for start, end in members:
+        if start not in nodes or end not in nodes:
+            raise ValueError(
+                f"Member {start}-{end} references a missing joint."
+            )
+
+        if start == end or np.allclose(nodes[start], nodes[end]):
+            raise ValueError(
+                f"Member {start}-{end} has zero length."
+            )
+
+except (ValueError, TypeError) as error:
+    st.error(f"Invalid truss geometry: {error}")
+    st.stop()
+
 node_names = list(nodes)
 node_index = {name: i for i, name in enumerate(node_names)}
+
+# CUSTOM SUPPORT EDITOR
+st.subheader("Support Editor")
+st.caption(
+    "Choose which joints are restrained. "
+    "Pin = X and Y; Horizontal roller = Y; "
+    "Vertical roller = X."
+)
+
+default_supports = pd.DataFrame([
+    {"Joint": "A", "Support Type": "Pin"},
+    {"Joint": "C", "Support Type": "Horizontal Roller"},
+])
+
+supports_df = st.data_editor(
+    default_supports,
+    num_rows="dynamic",
+    hide_index=True,
+    use_container_width=True,
+    key="support_editor",
+    column_config={
+        "Joint": st.column_config.SelectboxColumn(
+            "Joint",
+            options=node_names,
+            required=True
+        ),
+        "Support Type": st.column_config.SelectboxColumn(
+            "Support Type",
+            options=[
+                "Pin",
+                "Horizontal Roller",
+                "Vertical Roller",
+                "Fixed",
+                "Remove Support"
+        ],
+            required=True
+        )
+    }
+)
+
+# Convert support selections to restrained DOFs
+restrained = []
+
+try:
+    if supports_df.empty:
+        raise ValueError("At least one support is required.")
+
+    if supports_df[["Joint", "Support Type"]].isnull().any().any():
+        raise ValueError("Every support needs a joint and type.")
+
+    if supports_df["Joint"].duplicated().any():
+        raise ValueError("Each joint can have only one support.")
+
+    for _, row in supports_df.iterrows():
+        joint = str(row["Joint"])
+        support_type = str(row["Support Type"])
+
+        if joint not in node_index:
+            raise ValueError(f"Unknown support joint: {joint}")
+
+        idx = node_index[joint]
+
+        if support_type in ["Pin", "Fixed"]:
+            restrained.extend([2 * idx, 2 * idx + 1])
+
+        elif support_type == "Horizontal Roller":
+            restrained.append(2 * idx + 1)
+
+        elif support_type == "Vertical Roller":
+            restrained.append(2 * idx)
+
+        elif support_type == "Remove Support":
+            pass  # No restrained directions at this joint
+
+        else:
+            raise ValueError(
+                f"Unknown support type: {support_type}"
+            )
+
+    restrained = sorted(set(restrained))
+
+except ValueError as error:
+    st.error(f"Invalid support configuration: {error}")
+    st.stop()
+
 
 st.sidebar.header("Material and Section")
 material = st.sidebar.selectbox(
@@ -84,7 +241,7 @@ virtual_direction = st.sidebar.selectbox(
 )
 
 # All coordinates are in feet, converted to inches for stiffness.
-coords = np.array([nodes[n] for n in node_names]) * 12.0
+coords = np.array([nodes[n] for n in node_names])
 ndof = 2 * len(nodes)
 K = np.zeros((ndof, ndof))
 member_data = []
@@ -106,8 +263,7 @@ for start, end in members:
     K[np.ix_(dofs, dofs)] += k
     member_data.append((start, end, L, c, s, dofs))
 
-# A = pin (X,Y restrained); C = roller (Y restrained)
-restrained = [0, 1, 5]
+# Use the restraints selected in the Support Editor
 free = [i for i in range(ndof) if i not in restrained]
 
 def solve(force_vector):
@@ -202,8 +358,8 @@ if abs(Fx) > 1e-10 or abs(Fy) > 1e-10:
     )
 
 ax.set_aspect("equal", adjustable="datalim")
-ax.set_xlabel("X (ft)")
-ax.set_ylabel("Y (ft)")
+ax.set_xlabel("X (in)")
+ax.set_ylabel("Y (in)")
 ax.grid(alpha=0.25)
 ax.set_title("Blue = Tension | Red = Compression | Green = Load")
 st.pyplot(fig)
@@ -214,15 +370,24 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 with tab1:
-    st.subheader("Support Reactions")
-    st.dataframe(pd.DataFrame([
-        {"Support": "A", "Direction": "X", "Reaction (kip)": reactions[0]},
-        {"Support": "A", "Direction": "Y", "Reaction (kip)": reactions[1]},
-        {"Support": "C", "Direction": "Y", "Reaction (kip)": reactions[5]},
-    ]), hide_index=True, use_container_width=True)
+    st.subheader("Support Reactions") 
+    reaction_rows = []
+    for dof in restrained:
+        joint = node_names[dof // 2]
+        direction = "X" if dof % 2 == 0 else "Y"
+        reaction_rows.append({
+            "Support": joint,
+            "Direction": direction,
+            "Reaction (kip)": reactions[dof]
+        })
+    st.dataframe(
+        pd.DataFrame(reaction_rows),
+        hide_index=True,
+        use_container_width=True
+    )
     st.write("Equilibrium checks:")
-    st.write(f"ΣFx = {Fx + reactions[0]:.6f} kip")
-    st.write(f"ΣFy = {Fy + reactions[1] + reactions[5]:.6f} kip")
+    st.write(f"ΣFx = {Fx + sum(reactions[0::2]):.6f} kip")
+    st.write(f"ΣFy = {Fy + sum(reactions[1::2]):.6f} kip")
 
 with tab2:
     st.subheader("Axial Member Forces")
