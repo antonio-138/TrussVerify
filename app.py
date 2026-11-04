@@ -8,6 +8,22 @@ st.set_page_config(page_title="TrussVerify", page_icon="🏗️", layout="wide")
 st.title("🏗️ TrussVerify")
 st.caption("Independent 2D Truss Analysis and Verification")
 
+# STAAD.PRO FILE UPLOADER
+st.subheader("Import STAAD.Pro Model")
+
+uploaded_std = st.file_uploader(
+    "Upload a STAAD.Pro .std file",
+    type=["std"],
+    help="Upload a compatible 2D truss model."
+)
+
+if uploaded_std is not None:
+    st.success(f"File selected: {uploaded_std.name}")
+    st.info(
+        "File upload is working. "
+        "Geometry and property extraction will be added next."
+    )
+
 
 # CUSTOM TRUSS GEOMETRY EDITOR
 st.subheader("Custom Truss Geometry")
@@ -669,7 +685,7 @@ with tab1:
         " + ".join(moment_terms or ["0"])
         + f" = {total_moment:.6f} kip-in"
     )
-    
+
     st.write("Equilibrium checks:")
     st.write(f"ΣFx = {total_fx:.6f} kip")
     st.write(f"ΣFy = {total_fy:.6f} kip")
