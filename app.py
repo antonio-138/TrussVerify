@@ -19,11 +19,28 @@ default_joints = pd.DataFrame([
     {"Joint": "C", "X (in)": 240.0, "Y (in)": 0.0},
 ])
 
+
 default_members = pd.DataFrame([
-    {"Start": "A", "End": "B"},
-    {"Start": "B", "End": "C"},
-    {"Start": "A", "End": "C"},
+    {
+        "Start": "A",
+        "End": "B",
+        "Material": "Steel",
+        "Area (in²)": 2.0
+    },
+    {
+        "Start": "B",
+        "End": "C",
+        "Material": "Steel",
+        "Area (in²)": 2.0
+    },
+    {
+        "Start": "A",
+        "End": "C",
+        "Material": "Steel",
+        "Area (in²)": 2.0
+    }
 ])
+
 
 st.markdown("#### Joints")
 joints_df = st.data_editor(
@@ -35,13 +52,28 @@ joints_df = st.data_editor(
 )
 
 st.markdown("#### Members")
+
 members_df = st.data_editor(
     default_members,
     num_rows="dynamic",
     hide_index=True,
-    use_container_width=True,
-    key="member_editor"
+    width="stretch",
+    key="member_editor",
+    column_config={
+        "Material": st.column_config.SelectboxColumn(
+            "Material",
+            options=["Steel", "Aluminum", "Timber"],
+            required=True
+        ),
+        "Area (in²)": st.column_config.NumberColumn(
+            "Area (in²)",
+            min_value=0.01,
+            required=True,
+            format="%.3f"
+        )
+    }
 )
+
 
 # Validate the entered geometry before analysis
 try:
@@ -297,25 +329,66 @@ virtual_direction = st.sidebar.selectbox(
 # All coordinates are in feet, converted to inches for stiffness.
 coords = np.array([nodes[n] for n in node_names])
 ndof = 2 * len(nodes)
+
+# MEMBER MATERIAL PROPERTIES
+# E values are stored internally in ksi.
+material_E = {
+    "Steel": 29000.0,
+    "Aluminum": 10000.0,
+    "Timber": 1200.0
+}
+
 K = np.zeros((ndof, ndof))
 member_data = []
 
-for start, end in members:
+# Validate member properties before assembling stiffness
+if members_df[["Start", "End", "Material", "Area (in²)"]].isnull().any().any():
+    st.error("Every member must have joints, material, and area.")
+    st.stop()
+
+for _, row in members_df.iterrows():
+    start = str(row["Start"]).strip()
+    end = str(row["End"]).strip()
+    material = str(row["Material"])
+    member_A = float(row["Area (in²)"])
+
+    if material not in material_E:
+        st.error(f"Unsupported material: {material}")
+        st.stop()
+
+    if not np.isfinite(member_A) or member_A <= 0:
+        st.error(f"Invalid area for member {start}-{end}.")
+        st.stop()
+
+    member_E = material_E[material]
+
     i = node_index[start]
     j = node_index[end]
+
     dx, dy = coords[j] - coords[i]
     L = np.hypot(dx, dy)
+
+    if L <= 0:
+        st.error(f"Member {start}-{end} has zero length.")
+        st.stop()
+
     c, s = dx / L, dy / L
 
-    k = (E * A / L) * np.array([
+    k = (member_E * member_A / L) * np.array([
         [c*c, c*s, -c*c, -c*s],
         [c*s, s*s, -c*s, -s*s],
         [-c*c, -c*s, c*c, c*s],
         [-c*s, -s*s, c*s, s*s],
     ])
+
     dofs = [2*i, 2*i+1, 2*j, 2*j+1]
     K[np.ix_(dofs, dofs)] += k
-    member_data.append((start, end, L, c, s, dofs))
+
+    member_data.append((
+        start, end, L, c, s, dofs,
+        member_E, member_A
+    ))
+
 
 # Use the restraints selected in the Support Editor
 free = [i for i in range(ndof) if i not in restrained]
@@ -328,14 +401,16 @@ def solve(force_vector):
     reactions = K @ displacement - force_vector
 
     axial_forces = []
-    for start, end, L, c, s, dofs in member_data:
+    for start, end, L, c, s, dofs, member_E, member_A in member_data:
         u = displacement[dofs]
-        N = (E * A / L) * np.dot(
+        N = (member_E * member_A / L) * np.dot(
             np.array([-c, -s, c, s]), u
         )
+
         axial_forces.append(N)
 
     return displacement, reactions, np.array(axial_forces)
+
 
 
 # Build the global force vector from ALL joint loads
@@ -611,15 +686,20 @@ with tab4:
     st.latex(r"\delta = \sum_i \frac{N_i n_i L_i}{A_i E_i}")
 
     rows = []
-    for index, (start, end, L, c, s, dofs) in enumerate(member_data):
-        contribution = N[index] * n[index] * L / (A * E)
+    
+    for index, (start, end, L, c, s, dofs, member_E, member_A) in enumerate(member_data):
+        contribution = (
+            N[index] * n[index] * L
+            / (member_A * member_E)
+        )
+
         rows.append({
             "Member": f"{start}-{end}",
             "N (kip)": N[index],
             "n (kip/unit load)": n[index],
             "L (in)": L,
-            "A (in²)": A,
-            "E (ksi)": E,
+            "A (in²)": member_A,
+            "E (ksi)": member_E,
             "NnL/AE (in)": contribution
         })   
     # Create virtual work calculation table
