@@ -1021,6 +1021,107 @@ with tab1:
             - y * (F[2 * idx] + reactions[2 * idx])
         )
     # STEP-BY-STEP GLOBAL EQUILIBRIUM
+    # INDEPENDENT SUPPORT REACTIONS USING STATICS
+    st.subheader("Independent Support Reactions — Statics")
+    st.caption(
+        "Calculates reactions using only applied loads, support locations, "
+        "and the three equations of global equilibrium. "
+        "Stiffness-method reactions are used only for comparison."
+    )
+
+    if len(restrained) == 3:
+        equilibrium_matrix = np.zeros((3, 3))
+
+        for col, dof in enumerate(restrained):
+            joint = node_names[dof // 2]
+            x, y = nodes[joint]
+
+            if dof % 2 == 0:
+                # Horizontal reaction contributes to Fx and moment
+                equilibrium_matrix[:, col] = [1.0, 0.0, -y]
+            else:
+                # Vertical reaction contributes to Fy and moment
+                equilibrium_matrix[:, col] = [0.0, 1.0, x]
+
+        applied_fx = float(F[0::2].sum())
+        applied_fy = float(F[1::2].sum())
+
+        applied_moment = 0.0
+        for joint, idx in node_index.items():
+            x, y = nodes[joint]
+            applied_moment += (
+                x * F[2 * idx + 1]
+                - y * F[2 * idx]
+            )
+
+        equilibrium_rhs = -np.array([
+            applied_fx,
+            applied_fy,
+            applied_moment
+        ])
+
+        if np.linalg.matrix_rank(equilibrium_matrix) == 3:
+            statics_reactions = np.linalg.solve(
+                equilibrium_matrix,
+                equilibrium_rhs
+            )
+
+            comparison_rows = []
+
+            for col, dof in enumerate(restrained):
+                joint = node_names[dof // 2]
+                direction = "X" if dof % 2 == 0 else "Y"
+
+                statics_value = float(statics_reactions[col])
+                stiffness_value = float(reactions[dof])
+                difference = abs(statics_value - stiffness_value)
+
+                comparison_rows.append({
+                    "Support": joint,
+                    "Direction": direction,
+                    "Statics (kip)": statics_value,
+                    "Stiffness (kip)": stiffness_value,
+                    "Difference (kip)": difference
+                })
+
+            st.dataframe(
+                pd.DataFrame(comparison_rows).style.format({
+                    "Statics (kip)": "{:.4f}",
+                    "Stiffness (kip)": "{:.4f}",
+                    "Difference (kip)": "{:.6f}"
+                }),
+                hide_index=True,
+                use_container_width=True
+            )
+
+            max_difference = max(
+                row["Difference (kip)"]
+                for row in comparison_rows
+            )
+
+            if max_difference < 1e-5:
+                st.success(
+                    "PASS: Independent statics reactions agree "
+                    "with the stiffness-method reactions."
+                )
+            else:
+                st.warning(
+                    "CHECK: Independent statics reactions differ "
+                    "from the stiffness-method reactions."
+                )
+
+        else:
+            st.warning(
+                "The support reactions cannot be uniquely determined "
+                "from global equilibrium for this support arrangement."
+            )
+
+    else:
+        st.info(
+            "Independent reaction calculation requires exactly three "
+            "restrained translational degrees of freedom. "
+            "Other support arrangements may require additional equations."
+        )
     st.subheader("Step-by-Step Equilibrium Verification")
     st.caption(
         "Positive X is right, positive Y is up, "
