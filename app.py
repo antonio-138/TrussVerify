@@ -790,6 +790,11 @@ except np.linalg.LinAlgError:
 
 # Drawing
 st.subheader("Truss Diagram")
+st.caption(
+    "Member axial forces are in kips. "
+    "Positive (+) = tension; negative (-) = compression. "
+    "Green arrows represent applied joint loads."
+)
 fig, ax = plt.subplots(figsize=(10, 4))
 for index, (start, end) in enumerate(members):
     x1, y1 = nodes[start]
@@ -798,10 +803,34 @@ for index, (start, end) in enumerate(members):
         "blue" if N[index] > 1e-8 else "gray"
     )
     ax.plot([x1, x2], [y1, y2], color=color, linewidth=3)
+    # Position member force labels away from the member lines
+    dx = x2 - x1
+    dy = y2 - y1
+    length = np.hypot(dx, dy)
+
+    mid_x = (x1 + x2) / 2
+    mid_y = (y1 + y2) / 2
+
+    # Perpendicular offset from the member
+    offset = 12.0
+
+    label_x = mid_x - offset * dy / length
+    label_y = mid_y + offset * dx / length
+
     ax.text(
-        (x1+x2)/2, (y1+y2)/2,
-        f"{start}{end}: {N[index]:.2f}",
-        fontsize=9
+        label_x,
+        label_y,
+        f"{N[index]:+.2f}",
+        fontsize=8,
+        ha="center",
+        va="center",
+        bbox=dict(
+            facecolor="white",
+            edgecolor="none",
+            alpha=0.85,
+            pad=1.5
+        ),
+        zorder=10
     )
 
 for name, (x, y) in nodes.items():
