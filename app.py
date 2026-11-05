@@ -65,6 +65,149 @@ if uploaded_std is not None:
 
     joint_text = get_staad_section("JOINT COORDINATES")
     member_text = get_staad_section("MEMBER INCIDENCES")
+    support_text = get_staad_section("SUPPORTS")
+    # Import joint loads from one supported STAAD.Pro load case
+    imported_loads = []
+
+    load_lines = std_text.upper().splitlines()
+    unit_ok = any(
+        line.strip() == "UNIT INCHES KIP"
+        for line in load_lines
+    )
+
+    load_cases = [
+        i for i, line in enumerate(load_lines)
+        if line.strip().startswith("LOAD ")
+        and line.strip().split()[1].isdigit()
+    ]
+
+    if not unit_ok:
+        st.warning(
+            "Automatic load import currently requires UNIT INCHES KIP."
+        )
+
+    elif len(load_cases) != 1:
+        st.warning(
+            "Automatic load import currently supports exactly one "
+            "primary STAAD.Pro load case."
+        )
+
+    else:
+        in_joint_load = False
+        load_totals = {}
+
+        for raw_line in load_lines[load_cases[0] + 1:]:
+            line = raw_line.strip()
+
+            if line.startswith(("FINISH", "LOAD ", "LOAD COMB")):
+                break
+
+            if line == "JOINT LOAD":
+                in_joint_load = True
+                continue
+
+            if not in_joint_load or not line:
+                continue
+
+            # Stop at the next STAAD.Pro loading command
+            if line.startswith((
+                "MEMBER LOAD", "ELEMENT LOAD", "SELFWEIGHT",
+                "FLOOR LOAD", "REPEAT LOAD", "SUPPORT DISPLACEMENT"
+            )):
+                break
+
+            parts = line.split()
+
+            # Supported format: joint IDs followed by FX/FY and magnitude
+            force_positions = [
+                i for i, part in enumerate(parts)
+                if part in ("FX", "FY", "FZ", "MX", "MY", "MZ")
+            ]
+
+            if not force_positions:
+                st.warning(f"Unrecognized joint load: {line}")
+                continue
+
+            first_force = force_positions[0]
+            joint_ids = parts[:first_force]
+
+            if any(not j.isdigit() for j in joint_ids):
+                st.warning(f"Unsupported joint selection: {line}")
+                continue
+
+            force_tokens = parts[first_force:]
+
+            if len(force_tokens) % 2 != 0:
+                st.warning(f"Unsupported joint load: {line}")
+                continue
+
+            for joint_id in joint_ids:
+                
+
+                if joint_id not in load_totals:
+                    load_totals[joint_id] = [0.0, 0.0]
+
+                for i in range(0, len(force_tokens), 2):
+                    direction = force_tokens[i]
+                    magnitude = float(force_tokens[i + 1])
+
+                    if direction == "FX":
+                        load_totals[joint_id][0] += magnitude
+                    elif direction == "FY":
+                        load_totals[joint_id][1] += magnitude
+                    else:
+                        st.warning(
+                            f"{direction} at joint {joint_id} "
+                            "is not supported by this 2D truss solver."
+                        )
+
+    imported_loads = [
+        {
+            "Joint": joint_id,
+            "Fx (kip)": values[0],
+            "Fy (kip)": values[1]
+        }
+        for joint_id, values in load_totals.items()
+    ]
+    load_text = get_staad_section("JOINT LOAD")
+    
+    # Read support definitions from the STAAD.Pro file
+    imported_supports = []
+
+    support_entries = re.split(r"(?=\b\d+\s+(?:PINNED|ENFORCED)\b)", support_text)
+
+    for line in support_entries:
+        line = line.strip()
+        parts = line.strip().split()
+
+        if not parts:
+            continue
+
+        joint_id = parts[0]
+
+        if not joint_id.isdigit():
+            raise ValueError(
+                f"Unsupported STAAD.Pro support definition: {line}"
+            )
+
+        if len(parts) == 2 and parts[1] == "PINNED":
+            support_type = "Pin"
+
+        elif parts[1:] == [
+            "ENFORCED", "BUT", "FX", "FZ", "MX", "MY", "MZ"
+        ]:
+            support_type = "Horizontal Roller"
+
+        else:
+            raise ValueError(
+                f"Unsupported STAAD.Pro support definition: {line}"
+            )
+
+        imported_supports.append({
+            "Joint": joint_id,
+            "Support Type": support_type
+        })
+
 
     imported_nodes = {}
     imported_members = []
@@ -299,17 +442,85 @@ st.caption(
     "Vertical roller = X."
 )
 
-default_supports = pd.DataFrame([
-    {"Joint": "A", "Support Type": "Pin"},
-    {"Joint": "C", "Support Type": "Horizontal Roller"},
-])
+# Use imported STAAD.Pro supports when available.
+# Otherwise, use the example supports for the default truss.
+
+if uploaded_std is not None and imported_nodes:
+    
+    imported_support_rows = []
+
+    support_text = get_staad_section("SUPPORTS")
+
+    for entry in support_text.split(";"):
+        tokens = entry.strip().split()
+
+        if not tokens:
+            continue
+
+        support_keywords = {"PINNED", "FIXED"}
+
+        keyword_index = next(
+            (i for i, token in enumerate(tokens)
+             if token in support_keywords),
+            None
+        )
+
+        if keyword_index is None:
+            st.warning(
+                f"Unsupported STAAD.Pro support entry: {entry}"
+            )
+            continue
+
+        joint_ids = tokens[:keyword_index]
+        support_type = tokens[keyword_index]
+
+        # A full FIXED support also restrains rotations.
+        # This 2D truss solver only models X and Y translations.
+        if support_type == "PINNED":
+            editor_type = "Pin"
+        elif support_type == "FIXED" and keyword_index == len(tokens) - 1:
+            editor_type = "Fixed"
+        else:
+            st.warning(
+                f"Support entry needs manual review: {entry}"
+            )
+            continue
+
+        for joint_id in joint_ids:
+            if joint_id not in imported_nodes:
+                st.warning(
+                    f"Support references unknown joint {joint_id}."
+                )
+                continue
+
+            imported_support_rows.append({
+                "Joint": joint_id,
+                "Support Type": editor_type
+            })
+
+    default_supports = pd.DataFrame(
+    [
+        {
+            "Joint": str(support["Joint"]),
+            "Support Type": support["Support Type"]
+        }
+        for support in imported_supports
+    ],
+    columns=["Joint", "Support Type"]
+)
+
+else:
+        default_supports = pd.DataFrame([
+        {"Joint": "A", "Support Type": "Pin"},
+        {"Joint": "C", "Support Type": "Horizontal Roller"},
+    ])
 
 supports_df = st.data_editor(
     default_supports,
     num_rows="dynamic",
     hide_index=True,
     use_container_width=True,
-    key="support_editor",
+    key=f"support_editor_{uploaded_std.name if uploaded_std is not None else 'manual'}",
     column_config={
         "Joint": st.column_config.SelectboxColumn(
             "Joint",
@@ -403,16 +614,23 @@ st.caption(
     "All forces are in kips."
 )
 
-default_loads = pd.DataFrame([
-    {"Joint": "B", "Fx (kip)": 0.0, "Fy (kip)": -10.0}
-])
+# Load defaults for STAAD.Pro imports or manual models
+if uploaded_std is not None and imported_nodes:
+    default_loads = pd.DataFrame(
+        imported_loads,
+        columns=["Joint", "Fx (kip)", "Fy (kip)"]
+    )
+else:
+    default_loads = pd.DataFrame([
+        {"Joint": "B", "Fx (kip)": 0.0, "Fy (kip)": -10.0}
+    ])
 
 loads_df = st.data_editor(
     default_loads,
     num_rows="dynamic",
     hide_index=True,
     width="stretch",
-    key="load_editor",
+    key=f"load_editor_{uploaded_std.name if uploaded_std is not None else 'manual'}",
     column_config={
         "Joint": st.column_config.SelectboxColumn(
             "Joint",
