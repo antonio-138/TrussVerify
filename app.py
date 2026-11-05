@@ -3,6 +3,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import re
+import hashlib
 import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="TrussVerify", page_icon="🏗️", layout="wide")
@@ -13,168 +14,232 @@ st.caption("Independent 2D Truss Analysis and Verification")
 st.subheader("Import STAAD.Pro Model")
 uploaded_std = st.file_uploader(
     "Upload a STAAD.Pro .std file", type=["std"],
-    help="Upload a compatible 2D truss model in inches and kips."
+    help="Import compatible 2D XY trusses; supported units are converted to inches and kips."
 )
 
 imported_nodes = {}
 imported_members = []
 imported_supports = []
 imported_loads = []
+imported_properties = {}
 
 
 def parse_staad_truss(std_text):
-    """Import the supported subset of a 2D STAAD.Pro truss model.
+    """Parse a documented 2D, pin-jointed subset of STAAD.Pro input.
 
-    Reject unsupported loading and support definitions rather than silently
-    producing a different structural model.
+    Missing area/load information stays missing, rather than being invented.
+    Unsupported structural commands raise an explicit error.
     """
-    raw_lines = [line.split("*", 1)[0].strip().upper()
-                 for line in std_text.splitlines()]
-    lines = [line for line in raw_lines if line]
-    if not any(line == "UNIT INCHES KIP" for line in lines):
-        raise ValueError("Import requires UNIT INCHES KIP.")
-
-    section_heads = (
-        "JOINT COORDINATES", "MEMBER INCIDENCES", "ELEMENT INCIDENCES",
-        "DEFINE ", "END DEFINE", "MEMBER PROPERTY", "CONSTANTS",
-        "SUPPORTS", "MEMBER TRUSS", "MEMBER RELEASE", "MEMBER OFFSET",
-        "LOAD ", "LOAD COMB", "JOINT LOAD", "MEMBER LOAD",
-        "ELEMENT LOAD", "SELFWEIGHT", "FLOOR LOAD", "REPEAT LOAD",
-        "SUPPORT DISPLACEMENT", "PERFORM ANALYSIS", "FINISH",
-        "PRINT", "PARAMETER", "CHECK CODE", "UNIT ",
-    )
-
-    def section(name):
-        starts = [i for i, line in enumerate(lines) if line == name]
-        if len(starts) != 1:
-            raise ValueError(f"Expected exactly one {name} section.")
+    lines = [x.split("*", 1)[0].strip().upper() for x in std_text.splitlines()]
+    lines = [x for x in lines if x]
+    units = next((x for x in lines if x.startswith("UNIT ")), None)
+    if not units:
+        raise ValueError("Missing UNIT command; cannot safely interpret dimensions and forces.")
+    up = units.split()
+    length_factors = {"INCHES": 1, "INCH": 1, "FEET": 12, "FT": 12,
+                      "CM": 1/2.54, "METER": 100/2.54, "METERS": 100/2.54,
+                      "MM": 1/25.4}
+    force_factors = {"KIP": 1, "KIPS": 1, "POUND": .001, "LB": .001,
+                     "KN": .2248089431, "NEWTON": .0002248089431}
+    if len(up) != 3 or up[1] not in length_factors or up[2] not in force_factors:
+        raise ValueError(f"Unsupported units: {units}")
+    lf, ff = length_factors[up[1]], force_factors[up[2]]
+    heads = ("JOINT COORDINATES", "MEMBER INCIDENCES", "ELEMENT INCIDENCES",
+             "DEFINE ", "END DEFINE", "MEMBER PROPERTY", "CONSTANTS", "SUPPORTS",
+             "MEMBER TRUSS", "MEMBER RELEASE", "MEMBER OFFSET", "LOAD ",
+             "LOAD COMB", "JOINT LOAD", "MEMBER LOAD", "ELEMENT LOAD", "SELFWEIGHT",
+             "FLOOR LOAD", "REPEAT LOAD", "SUPPORT DISPLACEMENT", "PERFORM ANALYSIS",
+             "FINISH", "PRINT", "PARAMETER", "CHECK CODE", "UNIT ")
+    def section(name, required=False):
+        indices = [i for i, line in enumerate(lines) if line == name]
+        if not indices:
+            if required:
+                raise ValueError(f"Missing {name} section.")
+            return []
+        if len(indices) > 1:
+            raise ValueError(f"Multiple {name} sections are not supported.")
         result = []
-        for line in lines[starts[0] + 1:]:
-            if line.startswith(section_heads):
+        for line in lines[indices[0]+1:]:
+            if line.startswith(heads):
                 break
-            result.append(line)
+            result.extend(x.strip() for x in line.split(';') if x.strip())
         return result
-
-    nodes = {}
-    for entry in " ".join(section("JOINT COORDINATES")).split(";"):
-        parts = entry.split()
-        if not parts:
-            continue
-        if len(parts) != 4:
-            raise ValueError(f"Unsupported joint coordinate: {entry}")
-        joint_id = str(int(parts[0]))
-        x, y, z = map(float, parts[1:])
-        if abs(z) > 1e-8:
-            raise ValueError("Only trusses in the XY plane (Z=0) are supported.")
-        if joint_id in nodes:
-            raise ValueError(f"Duplicate joint {joint_id}.")
-        nodes[joint_id] = (x, y)
-
-    members = []
-    for entry in " ".join(section("MEMBER INCIDENCES")).split(";"):
-        parts = entry.split()
-        if not parts:
-            continue
-        if len(parts) != 3:
-            raise ValueError(f"Unsupported member incidence: {entry}")
-        member_id, start, end = parts
-        if start not in nodes or end not in nodes:
-            raise ValueError(f"Member {member_id} references an unknown joint.")
-        members.append((member_id, start, end))
-    if not nodes or not members:
-        raise ValueError("No joints or members found.")
-
-    supports = []
-    for entry in section("SUPPORTS"):
-        for item in entry.split(";"):
-            parts = item.split()
-            if not parts:
-                continue
-            if len(parts) == 2 and parts[1] == "PINNED":
-                joint_id, support_type = parts[0], "Pin"
-            elif len(parts) >= 4 and parts[1:3] == ["ENFORCED", "BUT"]:
-                joint_id = parts[0]
-                released = set(parts[3:])
-                valid = {"FX", "FY", "FZ", "MX", "MY", "MZ"}
-                if len(released) != len(parts[3:]) or not released <= valid:
-                    raise ValueError(f"Invalid support releases: {item}")
-                if "FX" in released and "FY" not in released:
-                    support_type = "Horizontal Roller"
-                elif "FY" in released and "FX" not in released:
-                    support_type = "Vertical Roller"
-                elif "FX" not in released and "FY" not in released:
-                    support_type = "Pin"
-                else:
-                    raise ValueError(f"Both in-plane directions released: {item}")
+    def expand(tokens):
+        result = []
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t == 'TO' or t == 'BY':
+                raise ValueError(f"Malformed joint/member selection: {' '.join(tokens)}")
+            if not t.isdigit():
+                raise ValueError(f"Unsupported joint/member selection: {' '.join(tokens)}")
+            if i + 2 < len(tokens) and tokens[i+1] == 'TO':
+                start, end = int(t), int(tokens[i+2])
+                step = 1
+                i += 3
+                if i + 1 < len(tokens) and tokens[i] == 'BY':
+                    step = int(tokens[i+1]); i += 2
+                if step <= 0 or end < start:
+                    raise ValueError('Invalid TO/BY range.')
+                result.extend(str(x) for x in range(start, end+1, step))
             else:
-                raise ValueError(f"Unsupported STAAD.Pro support: {item}")
-            if joint_id not in nodes:
-                raise ValueError(f"Support references unknown joint {joint_id}.")
-            supports.append({"Joint": joint_id, "Support Type": support_type})
-    if not supports:
-        raise ValueError("No supported restraints found.")
-
-    load_case_lines = [i for i, line in enumerate(lines)
-                       if re.match(r"^LOAD\s+\d+\b", line)]
-    if len(load_case_lines) != 1:
-        raise ValueError("Exactly one primary load case is required.")
-    totals = {}
-    in_joint_load = False
-    found_joint_load = False
-    for line in lines[load_case_lines[0] + 1:]:
-        if line == "JOINT LOAD":
-            in_joint_load = True
-            found_joint_load = True
-            continue
-        if line.startswith(("PERFORM ANALYSIS", "FINISH", "PRINT")):
-            break
-        if line.startswith(("MEMBER LOAD", "ELEMENT LOAD", "SELFWEIGHT",
-                            "FLOOR LOAD", "REPEAT LOAD", "SUPPORT DISPLACEMENT",
-                            "LOAD COMB", "LOAD ")):
-            raise ValueError(f"Unsupported load command: {line}")
-        if not in_joint_load:
-            raise ValueError(f"Unsupported load-case command: {line}")
-        for item in line.split(";"):
-            parts = item.split()
-            if not parts:
-                continue
-            axes = {"FX", "FY", "FZ", "MX", "MY", "MZ"}
-            positions = [i for i, part in enumerate(parts) if part in axes]
-            if not positions:
-                raise ValueError(f"Unrecognized joint load: {item}")
-            first = positions[0]
-            ids, forces = parts[:first], parts[first:]
-            if not ids or any(not joint.isdigit() or joint not in nodes
-                              for joint in ids):
-                raise ValueError(f"Unsupported joint selection: {item}")
-            if len(forces) % 2:
-                raise ValueError(f"Malformed joint load: {item}")
-            for joint_id in ids:
-                values = totals.setdefault(joint_id, [0.0, 0.0])
-                for i in range(0, len(forces), 2):
-                    direction = forces[i]
-                    if direction not in ("FX", "FY"):
-                        raise ValueError(f"Unsupported load direction {direction}.")
-                    magnitude = float(forces[i + 1])
-                    values[0 if direction == "FX" else 1] += magnitude
-    if not found_joint_load or not totals:
-        raise ValueError("No supported JOINT LOAD entries found.")
-    loads = [{"Joint": joint, "Fx (kip)": v[0], "Fy (kip)": v[1]}
-             for joint, v in totals.items()]
-    return nodes, members, supports, loads
+                result.append(str(int(t))); i += 1
+        return result
+    nodes = {}
+    for entry in section('JOINT COORDINATES', True):
+        t = entry.split()
+        if len(t) % 4:
+            raise ValueError(f"Invalid coordinates: {entry}")
+        for j in range(0, len(t), 4):
+            ident = str(int(t[j])); x, y, z = map(float, t[j+1:j+4])
+            if abs(z) > 1e-8:
+                raise ValueError('Only planar XY trusses (Z=0) are supported.')
+            if ident in nodes:
+                raise ValueError(f'Duplicate joint {ident}.')
+            nodes[ident] = (x*lf, y*lf)
+    members = []
+    for entry in section('MEMBER INCIDENCES', True):
+        t = entry.split()
+        if len(t) % 3:
+            raise ValueError(f'Invalid member incidence: {entry}')
+        for j in range(0, len(t), 3):
+            mid, start, end = t[j:j+3]
+            if start not in nodes or end not in nodes:
+                raise ValueError(f'Member {mid} references an unknown joint.')
+            members.append((mid, start, end))
+    if not nodes or not members:
+        raise ValueError('No joints or members found.')
+    member_ids = {m[0] for m in members}
+    if len(member_ids) != len(members):
+        raise ValueError('Duplicate member numbers.')
+    supports = []
+    for entry in section('SUPPORTS'):
+        t = entry.split()
+        pos = next((i for i, word in enumerate(t) if word in ('PINNED', 'FIXED', 'ENFORCED')), -1)
+        if pos < 1:
+            raise ValueError(f'Unsupported support: {entry}')
+        ids = expand(t[:pos]); kind = t[pos]; rest = t[pos+1:]
+        if kind == 'PINNED' and not rest:
+            support_type = 'Pin'
+        elif kind in ('FIXED', 'ENFORCED') and rest[:1] == ['BUT']:
+            released = set(rest[1:])
+            if not released <= {'FX','FY','FZ','MX','MY','MZ'}:
+                raise ValueError(f'Unsupported support release: {entry}')
+            if 'FX' in released and 'FY' in released:
+                raise ValueError(f'Both in-plane directions released: {entry}')
+            support_type = ('Horizontal Roller' if 'FX' in released else
+                            'Vertical Roller' if 'FY' in released else 'Pin')
+        elif kind in ('FIXED', 'ENFORCED') and not rest:
+            support_type = 'Pin'  # rotational restraint irrelevant to truss DOFs
+        else:
+            raise ValueError(f'Unsupported support: {entry}')
+        for ident in ids:
+            if ident not in nodes:
+                raise ValueError(f'Support references unknown joint {ident}.')
+            supports.append({'Joint': ident, 'Support Type': support_type})
+    if len({r['Joint'] for r in supports}) != len(supports):
+        raise ValueError('Multiple support definitions for the same joint.')
+    # Material E is converted from force/length² to ksi.
+    elastic = {}
+    current_material = None
+    for line in lines:
+        if line.startswith('ISOTROPIC '):
+            current_material = line.split(None, 1)[1]
+        elif line.startswith('END DEFINE'):
+            current_material = None
+        elif current_material and line.startswith('E '):
+            elastic[current_material] = float(line.split()[1]) * ff / lf**2
+    member_material = {}
+    for entry in section('CONSTANTS'):
+        t = entry.split()
+        if len(t) >= 3 and t[0] == 'MATERIAL':
+            mat = t[1]
+            ids = list(member_ids) if t[2:] == ['ALL'] else expand(t[2:])
+            for ident in ids:
+                if ident not in member_ids:
+                    raise ValueError(f'Material assignment references unknown member {ident}.')
+                member_material[ident] = mat
+    areas = {}
+    for entry in section('MEMBER PROPERTY'):
+        t = entry.split()
+        if 'PRIS' not in t or 'AX' not in t:
+            raise ValueError(f'Unsupported member property (need PRIS AX): {entry}')
+        pos = t.index('PRIS')
+        ids = expand(t[:pos]); prop = t[pos+1:]
+        if 'AX' not in prop or prop.index('AX')+1 >= len(prop):
+            raise ValueError(f'Missing AX area: {entry}')
+        area = float(prop[prop.index('AX')+1]) * lf**2
+        if area <= 0:
+            raise ValueError(f'Nonpositive area: {entry}')
+        for ident in ids:
+            if ident not in member_ids:
+                raise ValueError(f'Property references unknown member {ident}.')
+            areas[ident] = area
+    # Check for non-truss structural actions that the solver cannot reproduce.
+    for line in lines:
+        if line.startswith(('MEMBER RELEASE', 'MEMBER OFFSET', 'ELEMENT INCIDENCES',
+                            'MEMBER LOAD', 'ELEMENT LOAD', 'SELFWEIGHT', 'FLOOR LOAD',
+                            'REPEAT LOAD', 'SUPPORT DISPLACEMENT', 'LOAD COMB')):
+            raise ValueError(f'Unsupported 2D truss feature: {line}')
+    loads = []
+    load_headers = [i for i, line in enumerate(lines) if re.match(r'^LOAD\s+\d+\b', line)]
+    if len(load_headers) > 1:
+        raise ValueError('Multiple load cases detected; select/export one primary load case.')
+    if load_headers:
+        totals = {}
+        in_joint = False
+        for line in lines[load_headers[0]+1:]:
+            if line.startswith(('PERFORM ANALYSIS', 'FINISH', 'PRINT')):
+                break
+            if line == 'JOINT LOAD':
+                in_joint = True; continue
+            if line.startswith(heads):
+                raise ValueError(f'Unsupported load-case command: {line}')
+            if not in_joint:
+                raise ValueError(f'Unsupported load-case command: {line}')
+            for entry in line.split(';'):
+                t = entry.split()
+                if not t: continue
+                pos = next((i for i, word in enumerate(t) if word in ('FX','FY','FZ','MX','MY','MZ')), -1)
+                if pos < 1 or (len(t)-pos) % 2:
+                    raise ValueError(f'Unsupported joint load: {entry}')
+                ids = expand(t[:pos])
+                for ident in ids:
+                    if ident not in nodes:
+                        raise ValueError(f'Load references unknown joint {ident}.')
+                    values = totals.setdefault(ident, [0., 0.])
+                    for j in range(pos, len(t), 2):
+                        if t[j] not in ('FX','FY'):
+                            raise ValueError(f'Unsupported load component: {t[j]}')
+                        values[0 if t[j]=='FX' else 1] += float(t[j+1])*ff
+        loads = [{'Joint': ident, 'Fx (kip)': f[0], 'Fy (kip)': f[1]}
+                 for ident, f in totals.items()]
+    properties = {}
+    for mid, _, _ in members:
+        mat = member_material.get(mid)
+        properties[mid] = {'area': areas.get(mid), 'E': elastic.get(mat), 'material': mat}
+    return nodes, members, supports, loads, properties
 
 
 if uploaded_std is not None:
     st.success(f"File selected: {uploaded_std.name}")
     try:
         std_text = uploaded_std.getvalue().decode("utf-8", errors="replace")
-        imported_nodes, imported_members, imported_supports, imported_loads = ( 
+        imported_nodes, imported_members, imported_supports, imported_loads, imported_properties = ( 
             parse_staad_truss(std_text)
         )
     except (ValueError, TypeError, IndexError) as exc:
         st.error(f"Could not import STAAD.Pro model: {exc}")
         st.stop()
 
+    missing_area = [m for m, p in imported_properties.items() if p['area'] is None]
+    missing_E = [m for m, p in imported_properties.items() if p['E'] is None]
+    if missing_area:
+        st.warning(f"Missing member areas for {len(missing_area)} members. Enter actual areas in the Members Editor before analysis.")
+    if missing_E:
+        st.warning(f"Missing elastic modulus for {len(missing_E)} members. Enter actual E values in the Members Editor before analysis.")
+    if not imported_loads:
+        st.warning("No supported joint loads were defined. Add loads in the Joint Load Editor before analysis.")
     st.subheader("Imported STAAD.Pro Truss")
     fig_import, ax_import = plt.subplots(figsize=(9, 5))
     for member_id, start, end in imported_members:
@@ -216,19 +281,22 @@ default_members = pd.DataFrame([
         "Start": "A",
         "End": "B",
         "Material": "Steel",
-        "Area (in²)": 2.0
+        "Area (in²)": 2.0,
+        "E (ksi)": 29000.0
     },
     {
         "Start": "B",
         "End": "C",
         "Material": "Steel",
-        "Area (in²)": 2.0
+        "Area (in²)": 2.0,
+        "E (ksi)": 29000.0
     },
     {
         "Start": "A",
         "End": "C",
         "Material": "Steel",
-        "Area (in²)": 2.0
+        "Area (in²)": 2.0,
+        "E (ksi)": 29000.0
     }
 ])
 
@@ -247,8 +315,9 @@ if uploaded_std is not None and imported_nodes and imported_members:
         {
             "Start": start,
             "End": end,
-            "Material": "Steel",
-            "Area (in²)": 2.0
+            "Material": ("Aluminum" if "ALUMIN" in (imported_properties[member_id]['material'] or "") else "Timber" if "TIMBER" in (imported_properties[member_id]['material'] or "") or "WOOD" in (imported_properties[member_id]['material'] or "") else "Steel"),
+            "Area (in²)": imported_properties[member_id]['area'],
+            "E (ksi)": imported_properties[member_id]['E']
         }
         for member_id, start, end in imported_members
     ])
@@ -264,7 +333,7 @@ joints_df = st.data_editor(
     num_rows="dynamic",
     hide_index=True,
     use_container_width=True,
-    key="joint_editor"
+    key=f"joint_editor_{hashlib.sha256(uploaded_std.getvalue()).hexdigest()[:12] if uploaded_std is not None else 'manual'}"
 )
 
 st.markdown("#### Members")
@@ -274,16 +343,17 @@ members_df = st.data_editor(
     num_rows="dynamic",
     hide_index=True,
     width="stretch",
-    key="member_editor",
+    key=f"member_editor_{hashlib.sha256(uploaded_std.getvalue()).hexdigest()[:12] if uploaded_std is not None else 'manual'}",
     column_config={
         "Material": st.column_config.SelectboxColumn(
             "Material",
             options=["Steel", "Aluminum", "Timber"],
             required=True
         ),
+        "E (ksi)": st.column_config.NumberColumn("E (ksi)", min_value=0.001, format="%.3f"),
         "Area (in²)": st.column_config.NumberColumn(
             "Area (in²)",
-            min_value=0.01,
+            min_value=0.000001,
             required=True,
             format="%.3f"
         )
@@ -496,6 +566,9 @@ loads_df = st.data_editor(
 
 # Validate and collect all applied loads
 try:
+    if uploaded_std is not None and loads_df.empty:
+        st.info("Enter at least one joint load to analyze this imported model.")
+        st.stop()
     if loads_df.isnull().any().any():
         raise ValueError("Every load needs a joint, Fx, and Fy.")
 
@@ -538,7 +611,7 @@ K = np.zeros((ndof, ndof))
 member_data = []
 
 # Validate member properties before assembling stiffness
-if members_df[["Start", "End", "Material", "Area (in²)"]].isnull().any().any():
+if members_df[["Start", "End", "Material", "Area (in²)", "E (ksi)"]].isnull().any().any():
     st.error("Every member must have joints, material, and area.")
     st.stop()
 
@@ -556,7 +629,10 @@ for _, row in members_df.iterrows():
         st.error(f"Invalid area for member {start}-{end}.")
         st.stop()
 
-    member_E = material_E[material]
+    member_E = float(row["E (ksi)"])
+    if not np.isfinite(member_E) or member_E <= 0:
+        st.error(f"Invalid E for member {start}-{end}.")
+        st.stop()
 
     i = node_index[start]
     j = node_index[end]
