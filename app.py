@@ -1246,13 +1246,37 @@ with tab2:
         connected[start].append((j, dx / L, dy / L))
         connected[end].append((j, -dx / L, -dy / L))
 
-    # Applied joint loads plus stiffness-method reactions.
-    # Reactions will be independently calculated in a later step.
+    # METHOD OF JOINTS — USE INDEPENDENT STATICS REACTIONS
+
+    # Build a reaction vector without using stiffness-method reactions.
+    joint_reactions = np.zeros(ndof)
+
+    if len(restrained) == 3:
+        # Three independent reaction components can be solved
+        # using the equations of global equilibrium.
+        if np.linalg.matrix_rank(equilibrium_matrix) == 3:
+            for col, dof in enumerate(restrained):
+                joint_reactions[dof] = statics_reactions[col]
+        else:
+            st.warning(
+                "Independent statics reactions are unavailable: "
+                "the support equilibrium equations are singular."
+            )
+            st.stop()
+    else:
+        st.warning(
+            "Method of Joints verification currently requires "
+            "three independent support reaction components."
+        )
+        st.stop()
+
+    # Combine applied loads with independently calculated reactions.
     joint_external = {}
+
     for joint, idx in node_index.items():
         joint_external[joint] = (
-            float(F[2 * idx] + reactions[2 * idx]),
-            float(F[2 * idx + 1] + reactions[2 * idx + 1])
+            float(F[2 * idx] + joint_reactions[2 * idx]),
+            float(F[2 * idx + 1] + joint_reactions[2 * idx + 1])
         )
 
     solved_forces = {}
@@ -1371,6 +1395,66 @@ with tab2:
 
         # Show substituted numerical equations and solutions.
         st.markdown("**Solve the unknown member forces**")
+        
+        # SHOW METHOD OF JOINTS ALGEBRA
+        # Use the equilibrium equation that isolates each force.
+        remaining = list(range(len(unknown)))
+        known_contributions = np.array([known_x, known_y], dtype=float)
+
+        while remaining:
+            found = False
+
+            for pos in remaining:
+                other_positions = [k for k in remaining if k != pos]
+
+                for axis, axis_name in [(0, "x"), (1, "y")]:
+                    coefficient = unknown[pos][1 + axis]
+
+                    # The chosen equation must contain the target force,
+                    # but no other force that is still unknown.
+                    if abs(coefficient) <= tolerance:
+                        continue
+
+                    if any(
+                        abs(unknown[k][1 + axis]) > tolerance
+                        for k in other_positions
+                    ):
+                        continue
+
+                    j, cx, cy = unknown[pos]
+                    start, end, dx, dy, L = member_info[j]
+
+                    numerator = -known_contributions[axis]
+                    calculated = numerator / coefficient
+
+                    st.markdown(
+                        f"**Solve member {start}-{end} using ΣF{axis_name} = 0:**"
+                    )
+
+                    st.latex(
+                        rf"F_{{{start}-{end}}}"
+                        rf"=\frac{{{numerator:+.4f}}}"
+                        rf"{{{coefficient:+.4f}}}"
+                        rf"={calculated:+.4f}\ \mathrm{{kip}}"
+                    )
+
+                    # Substitute this solved force into both equations.
+                    known_contributions[0] += values[pos] * cx
+                    known_contributions[1] += values[pos] * cy
+
+                    remaining.remove(pos)
+                    found = True
+                    break
+
+                if found:
+                    break
+
+            if not found:
+                st.caption(
+                    "These member forces are solved simultaneously "
+                    "using the two joint equilibrium equations."
+                )
+                break
 
         for (j, cx, cy), value in zip(unknown, values):
             start, end, dx, dy, L = member_info[j]
