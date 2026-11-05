@@ -232,8 +232,6 @@ if uploaded_std is not None:
         st.error(f"Could not import STAAD.Pro model: {exc}")
         st.stop()
 
-    # Missing-property warnings are shown after the Members Editor, using
-    # the current edited values rather than the original imported defaults.
     if not imported_loads:
         st.warning("No supported joint loads were defined. Add loads in the Joint Load Editor before analysis.")
     st.subheader("Imported STAAD.Pro Truss")
@@ -339,7 +337,9 @@ members_df = st.data_editor(
     num_rows="dynamic",
     hide_index=True,
     width="stretch",
-    key=f"member_editor_{hashlib.sha256(uploaded_std.getvalue()).hexdigest()[:12] if uploaded_std is not None else 'manual'}",
+    # Versioned widget key resets stale Streamlit editor edits from earlier deployments.
+    # Otherwise old None area values can override newly imported AX values.
+    key=f"member_editor_v3_{hashlib.sha256(uploaded_std.getvalue()).hexdigest()[:12] if uploaded_std is not None else 'manual'}",
     column_config={
         "Material": st.column_config.SelectboxColumn(
             "Material",
@@ -357,24 +357,20 @@ members_df = st.data_editor(
 )
 
 
-# Check the CURRENT editor values, including user-entered corrections.
-# An imported .std may omit AX/E even though the user has supplied them.
-if uploaded_std is not None:
-    area_values = pd.to_numeric(members_df["Area (in²)"], errors="coerce")
-    e_values = pd.to_numeric(members_df["E (ksi)"], errors="coerce")
-    missing_area_count = int((area_values.isna() | (area_values <= 0)).sum())
-    missing_e_count = int((e_values.isna() | (e_values <= 0)).sum())
-    if missing_area_count:
-        st.warning(
-            f"Missing member areas for {missing_area_count} members. "
-            "Enter actual areas in the Members Editor before analysis."
-        )
-    if missing_e_count:
-        st.warning(
-            f"Missing elastic modulus for {missing_e_count} members. "
-            "Enter actual E values in the Members Editor before analysis."
-        )
-
+# Check the *effective editor values*, not just the raw STAAD import.
+# The editor can contain user changes or retained session-state edits.
+missing_area_count = int(members_df["Area (in²)"].isna().sum())
+missing_E_count = int(members_df["E (ksi)"].isna().sum())
+if missing_area_count:
+    st.warning(
+        f"Missing member areas for {missing_area_count} members. "
+        "Enter actual areas in the Members Editor before analysis."
+    )
+if missing_E_count:
+    st.warning(
+        f"Missing elastic modulus for {missing_E_count} members. "
+        "Enter actual E values in the Members Editor before analysis."
+    )
 
 # Validate the entered geometry before analysis
 try:
