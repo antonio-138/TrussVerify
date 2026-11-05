@@ -232,12 +232,8 @@ if uploaded_std is not None:
         st.error(f"Could not import STAAD.Pro model: {exc}")
         st.stop()
 
-    missing_area = [m for m, p in imported_properties.items() if p['area'] is None]
-    missing_E = [m for m, p in imported_properties.items() if p['E'] is None]
-    if missing_area:
-        st.warning(f"Missing member areas for {len(missing_area)} members. Enter actual areas in the Members Editor before analysis.")
-    if missing_E:
-        st.warning(f"Missing elastic modulus for {len(missing_E)} members. Enter actual E values in the Members Editor before analysis.")
+    # Missing-property warnings are shown after the Members Editor, using
+    # the current edited values rather than the original imported defaults.
     if not imported_loads:
         st.warning("No supported joint loads were defined. Add loads in the Joint Load Editor before analysis.")
     st.subheader("Imported STAAD.Pro Truss")
@@ -359,6 +355,25 @@ members_df = st.data_editor(
         )
     }
 )
+
+
+# Check the CURRENT editor values, including user-entered corrections.
+# An imported .std may omit AX/E even though the user has supplied them.
+if uploaded_std is not None:
+    area_values = pd.to_numeric(members_df["Area (in²)"], errors="coerce")
+    e_values = pd.to_numeric(members_df["E (ksi)"], errors="coerce")
+    missing_area_count = int((area_values.isna() | (area_values <= 0)).sum())
+    missing_e_count = int((e_values.isna() | (e_values <= 0)).sum())
+    if missing_area_count:
+        st.warning(
+            f"Missing member areas for {missing_area_count} members. "
+            "Enter actual areas in the Members Editor before analysis."
+        )
+    if missing_e_count:
+        st.warning(
+            f"Missing elastic modulus for {missing_e_count} members. "
+            "Enter actual E values in the Members Editor before analysis."
+        )
 
 
 # Validate the entered geometry before analysis
@@ -1166,31 +1181,44 @@ with tab2:
         connected[start].append((j, dx / L, dy / L))
         connected[end].append((j, -dx / L, -dy / L))
 
-    # METHOD OF JOINTS — USE INDEPENDENT STATICS REACTIONS
-
-    # Build a reaction vector without using stiffness-method reactions.
+    # METHOD OF JOINTS — select valid reaction source without stopping other tabs.
+    # Three independent reactions can be determined from global statics.
+    # Redundant support arrangements need compatibility/stiffness to find reactions.
     joint_reactions = np.zeros(ndof)
+    independent_joint_reactions = False
 
     if len(restrained) == 3:
-        # Three independent reaction components can be solved
-        # using the equations of global equilibrium.
-        if np.linalg.matrix_rank(equilibrium_matrix) == 3:
-            for col, dof in enumerate(restrained):
-                joint_reactions[dof] = statics_reactions[col]
-        else:
-            st.warning(
-                "Independent statics reactions are unavailable: "
-                "the support equilibrium equations are singular."
+        equilibrium_matrix_moj = np.zeros((3, 3))
+        for col, dof in enumerate(restrained):
+            joint = node_names[dof // 2]
+            x, y = nodes[joint]
+            equilibrium_matrix_moj[:, col] = (
+                [1.0, 0.0, -y] if dof % 2 == 0 else [0.0, 1.0, x]
             )
-            st.stop()
-    else:
-        st.warning(
-            "Method of Joints verification currently requires "
-            "three independent support reaction components."
-        )
-        st.stop()
+        if np.linalg.matrix_rank(equilibrium_matrix_moj) == 3:
+            applied_moment_moj = sum(
+                nodes[joint][0] * F[2*idx+1] - nodes[joint][1] * F[2*idx]
+                for joint, idx in node_index.items()
+            )
+            statics_reactions_moj = np.linalg.solve(
+                equilibrium_matrix_moj,
+                -np.array([F[0::2].sum(), F[1::2].sum(), applied_moment_moj])
+            )
+            for col, dof in enumerate(restrained):
+                joint_reactions[dof] = statics_reactions_moj[col]
+            independent_joint_reactions = True
 
-    # Combine applied loads with independently calculated reactions.
+    if not independent_joint_reactions:
+        # For statically indeterminate supports, the stiffness solution gives
+        # the compatible reactions. This is NOT an independent verification.
+        joint_reactions[restrained] = reactions[restrained]
+        st.info(
+            "Method of Joints uses stiffness-method support reactions for "
+            "this support arrangement. Member equilibrium can be checked, "
+            "but this is not an independent statics verification."
+        )
+
+    # Combine applied loads with the selected support reactions.
     joint_external = {}
 
     for joint, idx in node_index.items():
@@ -1397,7 +1425,10 @@ with tab2:
             "strategy or cannot be uniquely determined by this method."
         )
     else:
-        st.success("All member forces solved by Method of Joints.")
+        if independent_joint_reactions:
+            st.success("All member forces solved by independent Method of Joints.")
+        else:
+            st.success("All member forces satisfy joint equilibrium using stiffness-derived reactions.")
 
         comparison_rows = []
         for j, (start, end) in enumerate(members):
